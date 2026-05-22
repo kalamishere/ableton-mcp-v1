@@ -399,6 +399,9 @@ class AbletonMCP(ControlSurface):
                 track_index = params.get("track_index", 0)
                 device_index = params.get("device_index", 0)
                 response["result"] = self._get_drum_rack_pads(track_index, device_index)
+            # Bulk session state (ableton-mcp-v1 fork — P3)
+            elif command_type == "get_session_snapshot":
+                response["result"] = self._get_session_snapshot(params)
             elif command_type == "get_rack_macros":
                 track_index = params.get("track_index", 0)
                 device_index = params.get("device_index", 0)
@@ -1842,7 +1845,117 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error getting track info: " + str(e))
             raise
-    
+
+    def _get_session_snapshot(self, params):
+        """
+        Get tempo, transport and every track's state in ONE round-trip
+        (ableton-mcp-v1 fork — P3). Replaces get_session_info plus an N-call
+        loop of get_track_info. Best-effort per field/track: a single bad track
+        is reported inline instead of failing the whole snapshot.
+        """
+        try:
+            params = params or {}
+            include_tracks = params.get("include_tracks", True)
+            include_clips = params.get("include_clips", "summary")
+            include_devices = params.get("include_devices", True)
+            include_routing = params.get("include_routing", False)
+
+            song = self._song
+            snapshot = {
+                "tempo": song.tempo,
+                "signature": {
+                    "numerator": song.signature_numerator,
+                    "denominator": song.signature_denominator,
+                },
+                "is_playing": song.is_playing,
+                "song_time": song.current_song_time,
+                "track_count": len(song.tracks),
+                "return_track_count": len(song.return_tracks),
+                "scene_count": len(song.scenes),
+                "tracks": [],
+            }
+            if not include_tracks:
+                return snapshot
+
+            for track_index, track in enumerate(song.tracks):
+                try:
+                    snapshot["tracks"].append(self._snapshot_track(
+                        track, track_index, include_clips,
+                        include_devices, include_routing))
+                except Exception as track_err:
+                    snapshot["tracks"].append({
+                        "index": track_index,
+                        "error": "could not read track: " + str(track_err),
+                    })
+            return snapshot
+        except Exception as e:
+            self.log_message("Error getting session snapshot: " + str(e))
+            return {"error": str(e)}
+
+    def _snapshot_track(self, track, track_index, include_clips,
+                        include_devices, include_routing):
+        """Build one track's entry for _get_session_snapshot. Best-effort per field."""
+        def _safe(getter, default=None):
+            try:
+                return getter()
+            except Exception:
+                return default
+
+        entry = {
+            "index": track_index,
+            "name": track.name,
+            "is_audio_track": _safe(lambda: track.has_audio_input, False),
+            "is_midi_track": _safe(lambda: track.has_midi_input, False),
+            "is_group": _safe(lambda: track.is_foldable, False),
+            "mute": _safe(lambda: track.mute, False),
+            "solo": _safe(lambda: track.solo, False),
+            "arm": _safe(lambda: track.arm, False),
+            "volume": _safe(lambda: track.mixer_device.volume.value),
+            "panning": _safe(lambda: track.mixer_device.panning.value),
+        }
+
+        if include_clips and include_clips != "none":
+            full = include_clips == "full"
+            clip_slots = []
+            for slot_index, slot in enumerate(track.clip_slots):
+                has_clip = _safe(lambda: slot.has_clip, False)
+                if not has_clip:
+                    if full:
+                        clip_slots.append({
+                            "index": slot_index, "has_clip": False, "clip": None})
+                    continue
+                clip = slot.clip
+                clip_slots.append({
+                    "index": slot_index,
+                    "has_clip": True,
+                    "clip": {
+                        "name": _safe(lambda: clip.name),
+                        "length": _safe(lambda: clip.length),
+                        "is_playing": _safe(lambda: clip.is_playing, False),
+                        "is_midi_clip": _safe(lambda: clip.is_midi_clip),
+                    },
+                })
+            entry["clip_slots"] = clip_slots
+
+        if include_devices:
+            devices = []
+            for device_index, device in enumerate(track.devices):
+                devices.append({
+                    "index": device_index,
+                    "name": _safe(lambda: device.name),
+                    "class_name": _safe(lambda: device.class_name),
+                    "type": _safe(lambda: self._get_device_type(device)),
+                })
+            entry["devices"] = devices
+
+        if include_routing:
+            entry["routing"] = {
+                "input": _safe(lambda: track.input_routing_type.display_name),
+                "output": _safe(lambda: track.output_routing_type.display_name),
+            }
+
+        return entry
+
     def _create_midi_track(self, index):
         """Create a new MIDI track at the specified index"""
         try:

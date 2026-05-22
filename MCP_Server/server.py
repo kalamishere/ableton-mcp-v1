@@ -26,6 +26,46 @@ MCP_MAX_CONNECT_ATTEMPTS = int(os.environ.get("MCP_MAX_CONNECT_ATTEMPTS", "3"))
 ABLETON_HOST = os.environ.get("ABLETON_HOST", "localhost")
 ABLETON_PORT = int(os.environ.get("ABLETON_PORT", "9877"))
 
+
+# --- Structured result schema (ableton-mcp-v1 fork) -------------------------
+# Fork tools return a consistent JSON envelope so a caller never has to parse
+# human-readable prose to know whether a call succeeded. Shape (see FORK.md, P4):
+#   {"ok": bool, "data": any|null, "warnings": [str], "error_code": str|null,
+#    "message": str}
+# Only fork-added tools use this; the ~117 upstream tools keep their original
+# string returns, so existing clients are unaffected.
+def _result(ok_flag, data=None, warnings=None, error_code=None, message=""):
+    return json.dumps({
+        "ok": ok_flag,
+        "data": data,
+        "warnings": warnings or [],
+        "error_code": error_code,
+        "message": message,
+    }, indent=2)
+
+
+def ok(data=None, warnings=None, message=""):
+    """Success envelope: {ok:true, data, warnings, error_code:null, message}."""
+    return _result(True, data=data, warnings=warnings, message=message)
+
+
+def err(error_code, message, warnings=None):
+    """Error envelope: {ok:false, data:null, warnings, error_code, message}."""
+    return _result(False, data=None, warnings=warnings, error_code=error_code,
+                   message=message)
+
+
+# Sentinel error codes used across fork tools.
+ERR_NOT_CONNECTED = "ABLETON_NOT_CONNECTED"
+ERR_TRACK_NOT_FOUND = "TRACK_NOT_FOUND"
+ERR_CLIP_NOT_FOUND = "CLIP_NOT_FOUND"
+ERR_CLIP_TYPE_MISMATCH = "CLIP_TYPE_MISMATCH"
+ERR_NOT_MIDI_TRACK = "NOT_MIDI_TRACK"
+ERR_NO_VALID_NOTES = "NO_VALID_NOTES"
+ERR_ABLETON_ERROR = "ABLETON_ERROR"
+ERR_BAD_ARGUMENT = "BAD_ARGUMENT"
+
+
 @dataclass
 class AbletonConnection:
     host: str
@@ -2842,6 +2882,456 @@ def commit_groove(ctx: Context, track_index: int, clip_index: int) -> str:
     except Exception as e:
         logger.error(f"Error committing groove: {str(e)}")
         return f"Error committing groove: {str(e)}"
+
+# ============================================================================
+# ableton-mcp-v1 fork tools — reliability layer (see FORK.md)
+#   P1 atomic clip writing · P3 session snapshot · P5 honest export
+# Every tool below returns the structured {ok,data,warnings,error_code,message}
+# envelope from ok()/err(). The upstream tools above keep their string returns.
+# ============================================================================
+
+
+class _ForkError(Exception):
+    """A structured failure inside a fork tool — carries a stable error_code."""
+    def __init__(self, error_code, message):
+        self.error_code = error_code
+        self.message = message
+        super().__init__(message)
+
+
+def _validate_notes(notes):
+    """
+    Sanitize MIDI note dicts before they reach Ableton's atomic set_notes().
+    One malformed note makes Live reject the WHOLE batch, leaving the clip
+    silently empty — so coerce/clamp whatever can be salvaged and drop only the
+    unsalvageable. Returns (clean_notes, warnings).
+    """
+    clean = []
+    warnings = []
+    dropped = 0
+    clamped = 0
+    for raw in notes or []:
+        if not isinstance(raw, dict):
+            dropped += 1
+            continue
+        # pitch — number or numeric string; clamp to MIDI range 0-127
+        try:
+            pitch = int(round(float(raw.get("pitch"))))
+        except (TypeError, ValueError):
+            dropped += 1
+            continue
+        if pitch < 0 or pitch > 127:
+            clamped += 1
+            pitch = max(0, min(127, pitch))
+        # start_time — finite, non-negative beat offset
+        try:
+            start = float(raw.get("start_time"))
+        except (TypeError, ValueError):
+            dropped += 1
+            continue
+        if start != start or start < 0:   # NaN or negative
+            dropped += 1
+            continue
+        # duration — finite and positive; fall back to a 16th note
+        try:
+            duration = float(raw.get("duration"))
+        except (TypeError, ValueError):
+            duration = 0.25
+        if duration != duration or duration <= 0:
+            duration = 0.25
+        # velocity — finite, clamped to an audible 1-127
+        try:
+            velocity = int(round(float(raw.get("velocity"))))
+        except (TypeError, ValueError):
+            velocity = 100
+        velocity = max(1, min(127, velocity))
+        clean.append({
+            "pitch": pitch,
+            "start_time": start,
+            "duration": duration,
+            "velocity": velocity,
+            "mute": bool(raw.get("mute", False)),
+        })
+    if clamped:
+        warnings.append(f"clamped {clamped} note pitch(es) into the 0-127 MIDI range")
+    if dropped:
+        warnings.append(f"dropped {dropped} malformed note(s) — bad pitch or timing")
+    return clean, warnings
+
+
+def _fetch_track(ableton, track_index):
+    """Read a track's info dict, raising _ForkError on a missing/invalid track."""
+    try:
+        result = ableton.send_command("get_track_info", {"track_index": track_index})
+    except Exception as e:
+        raise _ForkError(ERR_ABLETON_ERROR, f"Could not read track {track_index}: {e}")
+    if not isinstance(result, dict) or result.get("error"):
+        detail = result.get("error") if isinstance(result, dict) else "no track data"
+        raise _ForkError(ERR_TRACK_NOT_FOUND, f"Track {track_index}: {detail}")
+    return result
+
+
+def _find_clip_slot(track, clip_index):
+    """Return the clip-slot dict at clip_index, or None if out of range."""
+    for slot in track.get("clip_slots", []):
+        if slot.get("index") == clip_index:
+            return slot
+    return None
+
+
+def _ensure_clip(ableton, track_index, clip_index, length_beats, mode="create_or_extend"):
+    """
+    Create a MIDI clip at the slot, or extend an existing one to length_beats.
+    length_beats is in BEATS, not bars. Live makes clip.length read-only after
+    creation, so an existing clip is lengthened via its loop markers.
+    Returns {created, extended, length_beats}. Raises _ForkError on failure.
+    mode: "create_or_extend" (default) or "create_only" (never touch an existing clip).
+    """
+    try:
+        length_beats = float(length_beats)
+    except (TypeError, ValueError):
+        raise _ForkError(ERR_BAD_ARGUMENT, "length_beats must be a number of beats")
+    if length_beats <= 0:
+        raise _ForkError(ERR_BAD_ARGUMENT, "length_beats must be positive")
+
+    track = _fetch_track(ableton, track_index)
+    if not track.get("is_midi_track", False):
+        raise _ForkError(
+            ERR_NOT_MIDI_TRACK,
+            f"Track {track_index} ('{track.get('name')}') is not a MIDI track — "
+            f"cannot write a MIDI clip here")
+
+    slot = _find_clip_slot(track, clip_index)
+    if not slot or not slot.get("has_clip"):
+        created = ableton.send_command("create_clip", {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "length": length_beats,
+        })
+        actual = created.get("length", length_beats) if isinstance(created, dict) else length_beats
+        return {"created": True, "extended": False, "length_beats": actual}
+
+    # A clip already exists. On a MIDI track it is a MIDI clip (audio clips are
+    # impossible here), so no CLIP_TYPE_MISMATCH check is needed beyond the
+    # is_midi_track guard above.
+    clip = slot.get("clip") or {}
+    try:
+        current_length = float(clip.get("length") or 0.0)
+    except (TypeError, ValueError):
+        current_length = 0.0
+    if mode == "create_only" or current_length >= length_beats:
+        return {"created": False, "extended": False, "length_beats": current_length}
+
+    # Extend by moving the loop end — clip.length itself cannot be set.
+    ableton.send_command("set_clip_loop", {
+        "track_index": track_index,
+        "clip_index": clip_index,
+        "loop_start": 0.0,
+        "loop_end": length_beats,
+        "looping": True,
+    })
+    return {"created": False, "extended": True, "length_beats": length_beats}
+
+
+@mcp.tool()
+def ensure_midi_clip(ctx: Context, track_index: int, clip_index: int,
+                     length_beats: float, mode: str = "create_or_extend") -> str:
+    """
+    Make sure a MIDI clip of at least length_beats exists at a slot.
+
+    Creates the clip if the slot is empty; extends it if it exists but is shorter
+    than requested. Fixes the "model asked for 8 bars but the clip plays 2" bug:
+    length is unambiguously in BEATS (8 bars of 4/4 = 32 beats).
+
+    Parameters:
+    - track_index: index of the (MIDI) track
+    - clip_index: index of the clip slot
+    - length_beats: required clip length in BEATS (not bars)
+    - mode: "create_or_extend" (default) or "create_only" (leave an existing clip as-is)
+
+    Returns {ok,data,...}; data = {created, extended, length_beats}.
+    """
+    try:
+        ableton = get_ableton_connection()
+        state = _ensure_clip(ableton, track_index, clip_index, length_beats, mode)
+        if state["created"]:
+            msg = f"Created MIDI clip at track {track_index} slot {clip_index} ({state['length_beats']} beats)"
+        elif state["extended"]:
+            msg = f"Extended clip at track {track_index} slot {clip_index} to {state['length_beats']} beats"
+        else:
+            msg = f"Clip at track {track_index} slot {clip_index} already ≥ requested length ({state['length_beats']} beats)"
+        return ok(data=state, message=msg)
+    except _ForkError as fe:
+        return err(fe.error_code, fe.message)
+    except Exception as e:
+        logger.error(f"Error in ensure_midi_clip: {str(e)}")
+        return err(ERR_ABLETON_ERROR, str(e))
+
+
+@mcp.tool()
+def replace_clip_notes(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    notes: List[Dict[str, Union[int, float, bool]]],
+) -> str:
+    """
+    Replace ALL notes in an existing clip in one atomic write.
+
+    Clears whatever was in the clip and writes the supplied notes via a single
+    set_notes() call — so re-running an edit never stacks stale notes. Notes are
+    validated first (pitch clamped 0-127, malformed notes dropped) so one bad
+    note can't wipe the clip. Pass an empty list to clear the clip.
+
+    The clip must already exist — use upsert_midi_clip to create-and-write.
+
+    Parameters:
+    - track_index / clip_index: the target slot
+    - notes: list of {pitch, start_time, duration, velocity, mute?} dicts
+
+    Returns {ok,data,...}; data = {note_count}.
+    """
+    clean, warnings = _validate_notes(notes)
+    if notes and not clean:
+        return err(ERR_NO_VALID_NOTES,
+                   "every supplied note was malformed — clip left unchanged",
+                   warnings=warnings)
+    try:
+        ableton = get_ableton_connection()
+        track = _fetch_track(ableton, track_index)
+        slot = _find_clip_slot(track, clip_index)
+        if not slot or not slot.get("has_clip"):
+            return err(ERR_CLIP_NOT_FOUND,
+                       f"No clip at track {track_index}, slot {clip_index} — "
+                       f"create it first (use upsert_midi_clip)",
+                       warnings=warnings)
+        # add_notes_to_clip replaces all notes via one atomic set_notes() call.
+        ableton.send_command("add_notes_to_clip", {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "notes": clean,
+        })
+        verb = "cleared" if not clean else f"replaced with {len(clean)} note(s)"
+        return ok(data={"note_count": len(clean)}, warnings=warnings,
+                  message=f"Clip at track {track_index} slot {clip_index} {verb}")
+    except _ForkError as fe:
+        return err(fe.error_code, fe.message, warnings=warnings)
+    except Exception as e:
+        logger.error(f"Error in replace_clip_notes: {str(e)}")
+        return err(ERR_ABLETON_ERROR, str(e), warnings=warnings)
+
+
+@mcp.tool()
+def upsert_midi_clip(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    length_beats: float,
+    notes: List[Dict[str, Union[int, float, bool]]],
+    name: Optional[str] = None,
+) -> str:
+    """
+    Create-or-extend a MIDI clip AND write its notes — the one-call safe path.
+
+    Combines ensure_midi_clip + replace_clip_notes (+ optional rename) so a model
+    can't get the order wrong or leave a clip too short. length_beats is in BEATS.
+    Notes are validated; malformed ones are dropped and reported in warnings.
+
+    Parameters:
+    - track_index / clip_index: the target slot
+    - length_beats: required clip length in BEATS (not bars)
+    - notes: list of {pitch, start_time, duration, velocity, mute?} dicts
+    - name: optional clip name
+
+    Returns {ok,data,...}; data = {created, extended, length_beats, note_count, name}.
+    """
+    clean, warnings = _validate_notes(notes)
+    if notes and not clean:
+        return err(ERR_NO_VALID_NOTES,
+                   "every supplied note was malformed — nothing written",
+                   warnings=warnings)
+    try:
+        ableton = get_ableton_connection()
+        state = _ensure_clip(ableton, track_index, clip_index, length_beats)
+        # add_notes_to_clip replaces; on a fresh clip this just writes the notes.
+        ableton.send_command("add_notes_to_clip", {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "notes": clean,
+        })
+        if name:
+            ableton.send_command("set_clip_name", {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "name": name,
+            })
+        data = dict(state)
+        data["note_count"] = len(clean)
+        data["name"] = name
+        how = "created" if state["created"] else ("extended" if state["extended"] else "reused")
+        return ok(data=data, warnings=warnings,
+                  message=f"Clip at track {track_index} slot {clip_index} {how}; "
+                          f"{len(clean)} note(s) written")
+    except _ForkError as fe:
+        return err(fe.error_code, fe.message, warnings=warnings)
+    except Exception as e:
+        logger.error(f"Error in upsert_midi_clip: {str(e)}")
+        return err(ERR_ABLETON_ERROR, str(e), warnings=warnings)
+
+
+@mcp.tool()
+def get_session_snapshot(ctx: Context, include_tracks: bool = True,
+                         include_clips: str = "summary", include_devices: bool = True,
+                         include_routing: bool = False) -> str:
+    """
+    Get the whole session — tempo, transport, every track — in ONE call.
+
+    Replaces calling get_session_info plus get_track_info once per track. Use this
+    to refresh state cheaply instead of many round-trips.
+
+    Parameters:
+    - include_tracks: include the per-track list (default True)
+    - include_clips: "summary" (name/length/playing per used slot), "none", or "full"
+    - include_devices: include each track's device list (default True)
+    - include_routing: include input/output routing per track (default False)
+
+    Returns {ok,data,...}; data = {tempo, signature, is_playing, song_time,
+    track_count, return_track_count, scene_count, tracks[]}.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_session_snapshot", {
+            "include_tracks": include_tracks,
+            "include_clips": include_clips,
+            "include_devices": include_devices,
+            "include_routing": include_routing,
+        })
+        if isinstance(result, dict) and result.get("error"):
+            return err(ERR_ABLETON_ERROR, result.get("error"))
+        return ok(data=result, message="Session snapshot captured")
+    except Exception as e:
+        logger.error(f"Error getting session snapshot: {str(e)}")
+        return err(ERR_ABLETON_ERROR, f"Could not get session snapshot: {e}")
+
+
+@mcp.tool()
+def get_export_capabilities(ctx: Context) -> str:
+    """
+    Honestly report what audio export/render this MCP can and cannot do.
+
+    Ableton's Live Object Model exposes NO programmatic audio render/export. This
+    tool exists so a host app stops guessing: it states plainly that native
+    render is unavailable, and lists what IS real (freeze, arrangement record,
+    loop setup). It makes no Ableton call and works even when Live is closed.
+    """
+    data = {
+        "native_audio_render": False,
+        "native_video_export": False,
+        "reason": "Ableton's Live Object Model exposes no programmatic render/export API.",
+        "available": {
+            "freeze_track": True,
+            "flatten_track": True,
+            "arrangement_record": True,
+            "capture_session_to_arrangement": True,
+            "set_arrangement_loop": True,
+        },
+        "guidance": (
+            "Real audio export goes through Ableton's File > Export Audio/Video "
+            "dialog, which is GUI-only. This MCP does not automate the GUI — the "
+            "host app owns that flow. Use prepare_session_for_export to set the "
+            "loop range, and record_session_to_arrangement to capture Session "
+            "clips into the Arrangement first if needed."
+        ),
+    }
+    return ok(data=data,
+              message="Native export is unavailable; see data.guidance for the honest path.")
+
+
+@mcp.tool()
+def prepare_session_for_export(ctx: Context, duration_beats: float = None) -> str:
+    """
+    Prepare the session for a manual audio export — does NOT render audio.
+
+    Sets the arrangement loop to [0, duration_beats] when a duration is given so
+    the host app's manual export covers exactly that range, and returns the
+    structured next steps. See get_export_capabilities for why no render happens.
+
+    Parameters:
+    - duration_beats: length of the region to export, in beats (optional)
+    """
+    warnings = []
+    loop_set = False
+    try:
+        ableton = get_ableton_connection()
+        if duration_beats is not None:
+            if duration_beats <= 0:
+                return err(ERR_BAD_ARGUMENT, "duration_beats must be positive")
+            ableton.send_command("set_arrangement_loop", {
+                "start": 0.0, "end": duration_beats, "enabled": True,
+            })
+            loop_set = True
+        else:
+            warnings.append("no duration_beats given — arrangement loop left unchanged")
+        data = {
+            "arrangement_loop_set": loop_set,
+            "duration_beats": duration_beats,
+            "next_steps": [
+                "Fire the Session clips/scene you want to capture, or call "
+                "record_session_to_arrangement to capture them into the Arrangement.",
+                "In the host app, run the manual Export Audio/Video flow "
+                "(Ableton File > Export Audio/Video).",
+            ],
+        }
+        return ok(data=data, warnings=warnings,
+                  message="Session prepared for manual export"
+                          + (f" over {duration_beats} beats" if loop_set else ""))
+    except Exception as e:
+        logger.error(f"Error preparing session for export: {str(e)}")
+        return err(ERR_ABLETON_ERROR, str(e), warnings=warnings)
+
+
+@mcp.tool()
+def record_session_to_arrangement(ctx: Context, duration_beats: float = None) -> str:
+    """
+    Start capturing Session-view clips into the Arrangement (not an audio export).
+
+    Enables Arrangement Record and starts playback so currently-firing Session
+    clips are written into the Arrangement. This captures MIDI/automation so a
+    later manual export can cover the whole piece. Call stop_playback when done.
+
+    Parameters:
+    - duration_beats: intended capture length in beats — sets the loop range; the
+      caller is still responsible for calling stop_playback (optional)
+    """
+    warnings = []
+    try:
+        ableton = get_ableton_connection()
+        if duration_beats is not None and duration_beats > 0:
+            ableton.send_command("set_arrangement_loop", {
+                "start": 0.0, "end": duration_beats, "enabled": False,
+            })
+        # toggle_arrangement_record only toggles. Read the resulting state and
+        # correct it, so we deterministically end up ARMED regardless of the
+        # prior record state.
+        res = ableton.send_command("toggle_arrangement_record")
+        armed = bool(res.get("arrangement_record")) if isinstance(res, dict) else False
+        if not armed:
+            res = ableton.send_command("toggle_arrangement_record")
+            armed = bool(res.get("arrangement_record")) if isinstance(res, dict) else False
+        if not armed:
+            return err(ERR_ABLETON_ERROR, "could not arm Arrangement Record")
+        ableton.send_command("start_playback")
+        data = {
+            "recording": True,
+            "duration_beats": duration_beats,
+            "stop_with": "stop_playback",
+        }
+        return ok(data=data, warnings=warnings,
+                  message="Arrangement recording started — call stop_playback to finish")
+    except Exception as e:
+        logger.error(f"Error recording session to arrangement: {str(e)}")
+        return err(ERR_ABLETON_ERROR, str(e), warnings=warnings)
+
 
 # Main execution
 def main():
