@@ -1,6 +1,6 @@
 [project]
 name = "ableton-mcp-v1"
-version = "0.1.0"
+version = "0.1.1"
 description = "V1-focused reliability fork of Ableton MCP: atomic clip writing, drum-pad mapping, bulk session snapshots, structured results, and honest export tooling for AI-assisted music creation."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -5,6 +5,14 @@ All notable changes to AbletonMCP will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-05-23 — audio clip import
+
+### Added
+- `create_audio_clip(track_index, clip_index, path)` — import a local audio file into
+  an audio track's clip slot. File-based audio handoff into Ableton — no sample
+  streaming through MCP. The slot must be empty and the track an audio track.
+  **Validated live on Ableton Live 12 Intro.** Returns the structured envelope.
+
 ## [0.1.0] - 2026-05-22 — ableton-mcp-v1 fork
 
 V1-focused reliability fork of Ableton MCP. See [FORK.md](FORK.md) for upstream

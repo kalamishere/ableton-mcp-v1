@@ -51,6 +51,13 @@ This fork moves those reliability concerns into the MCP.
   coerced, unsalvageable notes dropped and reported in `warnings`. One malformed note
   can never wipe a clip.
 
+### Audio clip import
+- `create_audio_clip(track_index, clip_index, path)` — import a local audio file
+  (e.g. a rendered WAV) into an empty slot on an audio track. Enables a file-based
+  audio handoff into Ableton without streaming samples through MCP. The target must
+  be an audio track and the slot empty. **Validated live on Ableton Live 12 Intro.**
+  Returns the structured envelope.
+
 ### Session snapshot — Priority 3
 - `get_session_snapshot(include_tracks, include_clips, include_devices, include_routing)`
   — tempo, transport, and every track's name/type/state/devices/clip summaries in

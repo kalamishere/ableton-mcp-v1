@@ -168,7 +168,7 @@ class AbletonConnection:
             "create_midi_track", "create_audio_track", "set_track_name",
             "set_track_mute", "set_track_solo", "set_track_arm",
             "delete_track", "duplicate_track", "set_track_color",
-            "create_clip", "delete_clip", "add_notes_to_clip", "set_clip_name",
+            "create_clip", "create_audio_clip", "delete_clip", "add_notes_to_clip", "set_clip_name",
             "duplicate_clip", "set_clip_color", "set_clip_loop",
             "remove_notes", "remove_all_notes", "transpose_notes",
             "set_tempo", "fire_clip", "stop_clip", "set_device_parameter",
@@ -646,6 +646,39 @@ def create_clip(ctx: Context, track_index: int, clip_index: int, length: float =
     except Exception as e:
         logger.error(f"Error creating clip: {str(e)}")
         return f"Error creating clip: {str(e)}"
+
+@mcp.tool()
+def create_audio_clip(ctx: Context, track_index: int, clip_index: int, path: str) -> str:
+    """
+    Import an audio file into an audio track's clip slot as an audio clip.
+
+    The file-based handoff that lets a host app drop rendered audio into Ableton
+    without streaming samples through MCP (verified on Ableton Live 12 Intro).
+    The target must be an AUDIO track and the slot must be empty.
+
+    Parameters:
+    - track_index: index of the (audio) track
+    - clip_index: index of the empty clip slot
+    - path: ABSOLUTE path to a supported audio file, visible to Ableton locally
+
+    Returns the structured {ok,data,...} envelope; data = {name, length, is_audio_clip}.
+    """
+    if not path:
+        return err(ERR_BAD_ARGUMENT, "path is required (absolute path to an audio file)")
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("create_audio_clip", {
+            "track_index": track_index,
+            "clip_index": clip_index,
+            "path": path
+        })
+        if isinstance(result, dict) and result.get("error"):
+            return err(ERR_ABLETON_ERROR, result.get("error"))
+        return ok(data=result,
+                  message=f"Imported audio clip at track {track_index} slot {clip_index}")
+    except Exception as e:
+        logger.error(f"Error creating audio clip: {str(e)}")
+        return err(ERR_ABLETON_ERROR, str(e))
 
 @mcp.tool()
 def delete_clip(ctx: Context, track_index: int, clip_index: int) -> str:
