@@ -1,8 +1,10 @@
 # ableton-mcp-v1
 
-> **This project is a V1-focused fork of the original [Ableton MCP](https://github.com/jpoindexter/ableton-mcp)**, with reliability-oriented tools for AI-assisted music creation in Ableton Live.
+> **A V1-focused fork of Ableton MCP**, with reliability-oriented tools for AI-assisted music creation in Ableton Live.
 >
-> It tracks upstream and adds atomic clip writing, drum-pad mapping, bulk session snapshots, structured result objects, and honest export-capability reporting. The fork is **additive** — no upstream tool is removed or renamed. See [FORK.md](FORK.md) for the full list of fork-only changes and upstream attribution.
+> **Credit / lineage:** Ableton MCP was originally created by **Siddharth Ahuja** — [ahujasid/ableton-mcp](https://github.com/ahujasid/ableton-mcp) (MIT). That's where it started. This fork is built directly on the expanded 2.0.0 build at [jpoindexter/ableton-mcp](https://github.com/jpoindexter/ableton-mcp) (vendored at commit `fa4f9ec`), which itself derives from Ahuja's original.
+>
+> It tracks upstream and adds atomic clip writing, drum-pad mapping, bulk session snapshots, structured result objects, honest export-capability reporting, and file-based audio import. The fork is **additive** — no upstream tool is removed or renamed. See [FORK.md](FORK.md) for the full list of fork-only changes and attribution.
 
 ---
 

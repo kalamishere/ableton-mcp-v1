@@ -6,11 +6,14 @@ build, and to stage clean improvements that can be upstreamed.
 
 ## Upstream attribution
 
-- **Project:** Ableton MCP
-- **Repo:** https://github.com/jpoindexter/ableton-mcp
-- **Authors:** Jason Poindexter, Siddharth Ahuja
-- **License:** MIT — preserved verbatim, see [`LICENSE`](LICENSE)
-- **Forked from commit:** `fa4f9ec40dcf536f7d15794ed82f09e53fbda430`
+Ableton MCP was **originally created by Siddharth Ahuja** —
+[ahujasid/ableton-mcp](https://github.com/ahujasid/ableton-mcp) (MIT). That's where it
+started. This fork is built on an expanded build of it:
+
+- **Original project:** [ahujasid/ableton-mcp](https://github.com/ahujasid/ableton-mcp) — Siddharth Ahuja (the root, ~2.6k★)
+- **Built directly on:** [jpoindexter/ableton-mcp](https://github.com/jpoindexter/ableton-mcp) — Jason Poindexter's 2.0.0 / 200+-tool expansion, which derives from the original
+- **Forked from commit:** `fa4f9ec40dcf536f7d15794ed82f09e53fbda430` (jpoindexter)
+- **License:** MIT — preserved verbatim, see [`LICENSE`](LICENSE) (© Siddharth Ahuja)
 
 This fork is **additive**. No upstream tool is removed or renamed, so any client
 written against upstream Ableton MCP keeps working unchanged. The intent is not to
@@ -85,6 +88,8 @@ This fork moves those reliability concerns into the MCP.
 
 ## Upstreaming
 
-Changes here are written to be upstreamable. The drum-pad, atomic-clip and
-session-snapshot tools are general-purpose and not V1-specific; they can be offered
-back to https://github.com/jpoindexter/ableton-mcp as PRs.
+Changes here are written to be upstreamable. The drum-pad, atomic-clip,
+session-snapshot and audio-import tools are general-purpose and not V1-specific.
+`create_audio_clip` has already been proposed upstream as PRs to both
+[ahujasid/ableton-mcp](https://github.com/ahujasid/ableton-mcp/pull/101) (the original)
+and [jpoindexter/ableton-mcp](https://github.com/jpoindexter/ableton-mcp/pull/1).
