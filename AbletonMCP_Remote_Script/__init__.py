@@ -655,7 +655,9 @@ class AbletonMCP(ControlSurface):
                                  "quantize_clip", "deselect_all_notes", "duplicate_clip_loop",
                                  "set_clip_notes", "move_clip_notes",
                                  # Scrub
-                                 "scrub_by"]:
+                                 "scrub_by",
+                                 # Arrangement
+                                 "duplicate_session_clip_to_arrangement"]:
                 # Use a thread-safe approach with a response queue
                 # maxsize=10 prevents unbounded memory growth
                 response_queue = queue.Queue(maxsize=10)
@@ -1203,6 +1205,12 @@ class AbletonMCP(ControlSurface):
                         elif command_type == "set_current_song_time":
                             time = params.get("time", 0)
                             result = self._set_current_song_time(time)
+                        elif command_type == "duplicate_session_clip_to_arrangement":
+                            track_index = params.get("track_index", 0)
+                            clip_index = params.get("clip_index", 0)
+                            destination_time = params.get("destination_time", 0.0)
+                            result = self._duplicate_session_clip_to_arrangement(
+                                track_index, clip_index, destination_time)
                         elif command_type == "create_return_track":
                             result = self._create_return_track()
                         elif command_type == "delete_return_track":
@@ -6380,6 +6388,32 @@ class AbletonMCP(ControlSurface):
         try:
             self._song.current_song_time = time
             return {"success": True}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _duplicate_session_clip_to_arrangement(self, track_index, clip_index, destination_time):
+        """Copy a Session clip onto the Arrangement timeline of the same track.
+
+        Wraps Live's Track.duplicate_clip_to_arrangement (Live 11/12). Ported
+        from upstream ableton-mcp so the fork can place clips on a timeline
+        rather than only in Session slots.
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                return {"error": "Track index out of range"}
+            track = self._song.tracks[track_index]
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                return {"error": "Clip index out of range"}
+            slot = track.clip_slots[clip_index]
+            if not slot.has_clip:
+                return {"error": "No clip in that slot"}
+            clip = slot.clip
+            new_clip = track.duplicate_clip_to_arrangement(clip, float(destination_time))
+            return {"duplicated": True,
+                    "clip_name": clip.name,
+                    "track_name": track.name,
+                    "destination_time": float(destination_time),
+                    "length": getattr(new_clip, "length", None)}
         except Exception as e:
             return {"error": str(e)}
 

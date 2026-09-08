@@ -265,7 +265,8 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
 # Create the MCP server with lifespan support
 mcp = FastMCP(
     "AbletonMCP",
-    description="Ableton Live integration through the Model Context Protocol",
+    # `description` was removed from FastMCP.__init__ in later mcp 1.x and
+    # raises TypeError at import. Upstream dropped it for the same reason.
     lifespan=server_lifespan
 )
 
@@ -3367,6 +3368,109 @@ def record_session_to_arrangement(ctx: Context, duration_beats: float = None) ->
 
 
 # Main execution
+@mcp.tool()
+def set_arrangement_time(ctx: Context, time: float) -> str:
+    """
+    Move the arrangement playhead to a specific position.
+
+    Parameters:
+    - time: Position in beats from the start of the arrangement
+            (e.g. 8.0 = bar 3 in 4/4)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_current_song_time", {"time": time})
+        if result.get("error"):
+            return result["error"]
+        return f"Playhead moved to beat {time}"
+    except Exception as e:
+        logger.error(f"Error setting arrangement time: {str(e)}")
+        return f"Error setting arrangement time: {str(e)}"
+
+
+@mcp.tool()
+def duplicate_to_arrangement(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    destination_time: float,
+) -> str:
+    """
+    Copy a Session-view clip onto the Arrangement timeline.
+
+    Uses Live's track.duplicate_clip_to_arrangement() (Live 11 / 12). The clip
+    is placed at destination_time beats from the start of the arrangement, on
+    the track that owns it.
+
+    Typical workflow:
+      1. create_audio_clip / create_clip to build the Session clip
+      2. duplicate_to_arrangement once per position you need
+      3. set_arrangement_time to move the playhead and check the result
+
+    Parameters:
+    - track_index:      Index of the track that owns the Session clip
+    - clip_index:       Index of that track's clip slot (Session view)
+    - destination_time: Beat position in the arrangement
+                        (0.0 = start, 8.0 = bar 3 in 4/4)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command(
+            "duplicate_session_clip_to_arrangement",
+            {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "destination_time": destination_time,
+            },
+        )
+        if result.get("error"):
+            return result["error"]
+        return (f"Placed '{result.get('clip_name', 'clip')}' on "
+                f"{result.get('track_name', f'track {track_index}')} "
+                f"at beat {destination_time}")
+    except Exception as e:
+        logger.error(f"Error duplicating to arrangement: {str(e)}")
+        return f"Error duplicating to arrangement: {str(e)}"
+
+
+@mcp.tool()
+def switch_to_arrangement_view(ctx: Context) -> str:
+    """
+    Switch Ableton's main window to the Arrangement view.
+
+    Convenience wrapper over focus_view("Arranger") — the Remote Script already
+    handles focus_view, so this needs no script-side change.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ableton.send_command("focus_view", {"view_name": "Arranger"})
+        return "Switched to Arrangement view"
+    except Exception as e:
+        logger.error(f"Error switching to arrangement view: {str(e)}")
+        return f"Error switching to arrangement view: {str(e)}"
+
+
+@mcp.tool()
+def trigger_back_to_arrangement(ctx: Context) -> str:
+    """
+    Return every track to the Arrangement timeline.
+
+    Launching a Session clip latches its track away from the Arrangement, and
+    stopping that clip does NOT hand the track back — the track stays silent
+    until Back to Arrangement is pressed. Call this after firing Session clips
+    if you then want arrangement playback to be heard.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("trigger_back_to_arrangement")
+        if isinstance(result, dict) and result.get("error"):
+            return result["error"]
+        return "All tracks returned to the Arrangement"
+    except Exception as e:
+        logger.error(f"Error triggering back to arrangement: {str(e)}")
+        return f"Error triggering back to arrangement: {str(e)}"
+
+
 def main():
     """Run the MCP server"""
     mcp.run()
